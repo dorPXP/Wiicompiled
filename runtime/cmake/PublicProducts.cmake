@@ -291,12 +291,16 @@ function(mkw_configure_product target)
     # CA bundle to verify server certificates against - Windows gets this for free from the OS via
     # Schannel, mbed TLS does not ship one itself. Not SHA256-pinned like the DSP ROM above: unlike
     # a fixed hardware ROM, this bundle is expected to be refreshed periodically as CAs rotate.
-    set(MKW_CA_CERTIFICATE_BUNDLE "${MKW_RUNTIME_SOURCE_DIR}/assets/certs/cacert.pem")
-    if(NOT EXISTS "${MKW_CA_CERTIFICATE_BUNDLE}")
-        message(FATAL_ERROR "Missing TLS root CA bundle: ${MKW_CA_CERTIFICATE_BUNDLE}")
+    # Windows gets its trust store from Schannel, so only the platforms that actually build the
+    # mbed TLS path need the bundle beside the executable.
+    if(NOT MKW_PLATFORM_WINDOWS)
+        set(MKW_CA_CERTIFICATE_BUNDLE "${MKW_RUNTIME_SOURCE_DIR}/assets/certs/cacert.pem")
+        if(NOT EXISTS "${MKW_CA_CERTIFICATE_BUNDLE}")
+            message(FATAL_ERROR "Missing TLS root CA bundle: ${MKW_CA_CERTIFICATE_BUNDLE}")
+        endif()
+        add_custom_command(TARGET ${target} POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${MKW_CA_CERTIFICATE_BUNDLE}" "$<TARGET_FILE_DIR:${target}>/cacert.pem")
     endif()
-    add_custom_command(TARGET ${target} POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy_if_different
-        "${MKW_CA_CERTIFICATE_BUNDLE}" "$<TARGET_FILE_DIR:${target}>/cacert.pem")
 endfunction()
 
 add_executable(WiiCompiled "${MKW_BASE_PRODUCT_SOURCE}" ${MKW_BASE_REGISTRATION_SOURCES})

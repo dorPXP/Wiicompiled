@@ -118,22 +118,31 @@ endif()
 # source tree, so the repository ships the compiled dependency rather than ~280 tracked upstream
 # files. Bump MKW_MBEDTLS_VERSION/MKW_MBEDTLS_SHA256 together when updating; the hash comes from
 # upstream's own signed `mbedtls-<version>-sha256sum.txt` release asset.
-include(FetchContent)
-set(MKW_MBEDTLS_VERSION "3.6.7")
-set(MKW_MBEDTLS_SHA256 "a7e8bcbec0e6f761b4af24f25677626b35f762f68eef79c08677a363212d11f6")
-FetchContent_Declare(mkw_mbedtls_upstream
-    URL "https://github.com/Mbed-TLS/mbedtls/releases/download/mbedtls-${MKW_MBEDTLS_VERSION}/mbedtls-${MKW_MBEDTLS_VERSION}.tar.bz2"
-    URL_HASH SHA256=${MKW_MBEDTLS_SHA256})
-# Subproject mode already defaults ENABLE_TESTING off and skips codegen (GEN_FILES), but
-# ENABLE_PROGRAMS defaults on and installation/package-config isn't wanted for a linked-in copy.
-set(ENABLE_PROGRAMS OFF CACHE BOOL "" FORCE)
-set(ENABLE_TESTING OFF CACHE BOOL "" FORCE)
-set(MBEDTLS_FATAL_WARNINGS OFF CACHE BOOL "" FORCE)
-set(DISABLE_PACKAGE_CONFIG_AND_INSTALL ON CACHE BOOL "" FORCE)
-FetchContent_MakeAvailable(mkw_mbedtls_upstream)
+#
+# The alias exists on every platform so the link lines in cmake/PublicProducts.cmake stay
+# platform-independent, but it is only populated where network_ssl.cpp actually compiles the mbed
+# TLS path (`#ifndef _WIN32`). Windows keeps Schannel and must not fetch anything: its builds run
+# with FETCHCONTENT_FULLY_DISCONNECTED=ON against the offline dependency set prepared by
+# Launcher/Prepare-Dependencies.ps1, so an unconditional fetch would fail a clean configure there
+# and would also add a dependency Windows never links.
 add_library(mkw_mbedtls INTERFACE)
 add_library(mkw::mbedtls ALIAS mkw_mbedtls)
-target_link_libraries(mkw_mbedtls INTERFACE MbedTLS::mbedtls MbedTLS::mbedx509 MbedTLS::mbedcrypto)
+if(NOT MKW_PLATFORM_WINDOWS)
+    include(FetchContent)
+    set(MKW_MBEDTLS_VERSION "3.6.7")
+    set(MKW_MBEDTLS_SHA256 "a7e8bcbec0e6f761b4af24f25677626b35f762f68eef79c08677a363212d11f6")
+    FetchContent_Declare(mkw_mbedtls_upstream
+        URL "https://github.com/Mbed-TLS/mbedtls/releases/download/mbedtls-${MKW_MBEDTLS_VERSION}/mbedtls-${MKW_MBEDTLS_VERSION}.tar.bz2"
+        URL_HASH SHA256=${MKW_MBEDTLS_SHA256})
+    # Subproject mode already defaults ENABLE_TESTING off and skips codegen (GEN_FILES), but
+    # ENABLE_PROGRAMS defaults on and installation/package-config isn't wanted for a linked-in copy.
+    set(ENABLE_PROGRAMS OFF CACHE BOOL "" FORCE)
+    set(ENABLE_TESTING OFF CACHE BOOL "" FORCE)
+    set(MBEDTLS_FATAL_WARNINGS OFF CACHE BOOL "" FORCE)
+    set(DISABLE_PACKAGE_CONFIG_AND_INSTALL ON CACHE BOOL "" FORCE)
+    FetchContent_MakeAvailable(mkw_mbedtls_upstream)
+    target_link_libraries(mkw_mbedtls INTERFACE MbedTLS::mbedtls MbedTLS::mbedx509 MbedTLS::mbedcrypto)
+endif()
 
 set(MKW_TRANSLATED_COMPILE_JOBS 0 CACHE STRING
     "Cap on concurrently compiling translated shard TUs via a Ninja job pool (0 = uncapped). \
