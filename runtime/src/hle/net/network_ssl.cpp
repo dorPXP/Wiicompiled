@@ -570,6 +570,42 @@ static mbedtls_x509_crt g_mbedtlsCaChain;
 static mbedtls_entropy_context g_mbedtlsEntropy;
 static mbedtls_ctr_drbg_context g_mbedtlsCtrDrbg;
 
+static ssize_t SendSslSocket(NativeSocket socket, const uint8_t* data, size_t size) {
+#ifdef __APPLE__
+    const int noSigPipe = 1;
+    if (setsockopt(socket, SOL_SOCKET, SO_NOSIGPIPE, &noSigPipe, sizeof(noSigPipe)) != 0) {
+        return -1;
+    }
+    return send(socket, data, size, 0);
+#else
+    return send(socket, data, size, MSG_NOSIGNAL);
+#endif
+}
+
+static int MbedtlsSend(void* context, const unsigned char* data, size_t size) {
+    const auto* net = static_cast<mbedtls_net_context*>(context);
+    const ssize_t result = SendSslSocket(net->fd, data, size);
+    if (result >= 0) {
+        return static_cast<int>(result);
+    }
+    if (errno == EINTR) {
+        return MBEDTLS_ERR_SSL_WANT_WRITE;
+    }
+    if (errno == EPIPE || errno == ECONNRESET) {
+        return MBEDTLS_ERR_NET_CONN_RESET;
+    }
+    return MBEDTLS_ERR_NET_SEND_FAILED;
+}
+
+static int MbedtlsRecv(void* context, unsigned char* data, size_t size) {
+    const int result = mbedtls_net_recv(context, data, size);
+    // Blocking socket timeouts must leave the TLS session retryable.
+    if (result == MBEDTLS_ERR_NET_RECV_FAILED && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+        return MBEDTLS_ERR_SSL_WANT_READ;
+    }
+    return result;
+}
+
 // Mirrors ax_mix.cpp's FindDspCoefficientRom exactly - same three places a bundled asset can live
 // depending on platform and how the binary was launched (next to the desktop executable, the
 // Android app's own data directory, or a source-tree checkout during development).
@@ -668,11 +704,8 @@ static int32_t EnsureMbedtlsSession(SslSession& ssl) {
     // Windows path's own "refuse an empty hostname" check just above SslHandshakeImpl.
     mbedtls_ssl_set_hostname(&ssl.sslContext, ssl.hostname.c_str());
 
-    // ssl.native is already a connected, blocking POSIX socket by the time DOHANDSHAKE runs (see
-    // IOCTLV_NET_SSL_CONNECT) - wrapping it in mbed TLS's own net_context and using its own
-    // send/recv callbacks reuses a well-tested implementation instead of hand-rolling one.
     ssl.netContext.fd = static_cast<int>(ssl.native);
-    mbedtls_ssl_set_bio(&ssl.sslContext, &ssl.netContext, mbedtls_net_send, mbedtls_net_recv, nullptr);
+    mbedtls_ssl_set_bio(&ssl.sslContext, &ssl.netContext, MbedtlsSend, MbedtlsRecv, nullptr);
 
     ssl.haveSsl = true;
     return SSL_OK;
@@ -708,10 +741,7 @@ static int32_t SslHandshakeImpl(SslSession& ssl) {
         return setupRet;
     }
 
-    // The connect-time SO_RCVTIMEO/SO_SNDTIMEO bound a single blocking send()/recv(), but mbed
-    // TLS's net_sockets layer maps a timed-out recv() to MBEDTLS_ERR_SSL_WANT_READ - the same
-    // code used for "try again" - so without a deadline here this loop would just retry forever,
-    // one 15s block at a time, instead of ever giving up on a peer that never sends TLS data.
+    // Receive timeouts are retryable, but the handshake must still terminate.
     const auto handshakeDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(15);
     int handshakeRet;
     while ((handshakeRet = mbedtls_ssl_handshake(&ssl.sslContext)) != 0) {
@@ -720,10 +750,6 @@ static int32_t SslHandshakeImpl(SslSession& ssl) {
                 NetFail("ssl handshake TIMED OUT host=%s", ssl.hostname.c_str());
                 return SSL_ERR_FAILED;
             }
-            // The socket is set blocking before the handshake ever starts (IOCTLV_NET_SSL_CONNECT),
-            // so mbed TLS's own send/recv callbacks either return real data or a real error - a
-            // WANT_READ/WANT_WRITE here means retry the same call immediately, not "come back
-            // later" the way it would for a nonblocking socket.
             continue;
         }
         char errorBuffer[256];
@@ -747,7 +773,7 @@ static int32_t SslWrite(SslSession& ssl, const uint8_t* data, uint32_t size) {
     if (ssl.plaintextWfc) {
         uint32_t total = 0;
         while (total < size) {
-            const ssize_t sent = send(ssl.native, data + total, size - total, 0);
+            const ssize_t sent = SendSslSocket(ssl.native, data + total, size - total);
             if (sent <= 0) {
                 return SSL_ERR_SYSCALL;
             }
@@ -760,6 +786,7 @@ static int32_t SslWrite(SslSession& ssl, const uint8_t* data, uint32_t size) {
     // one TLS record) - the caller must resend the remainder starting from where it left off, so
     // loop here until every byte is actually written rather than returning the first partial count.
     uint32_t totalWritten = 0;
+    const auto writeDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(15);
     while (totalWritten < size) {
         const int ret = mbedtls_ssl_write(&ssl.sslContext, data + totalWritten, size - totalWritten);
         if (ret > 0) {
@@ -767,6 +794,9 @@ static int32_t SslWrite(SslSession& ssl, const uint8_t* data, uint32_t size) {
             continue;
         }
         if (ret == MBEDTLS_ERR_SSL_WANT_READ || ret == MBEDTLS_ERR_SSL_WANT_WRITE) {
+            if (std::chrono::steady_clock::now() >= writeDeadline) {
+                return SSL_ERR_FAILED;
+            }
             continue;
         }
         return SSL_ERR_FAILED;
